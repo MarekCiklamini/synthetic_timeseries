@@ -1,43 +1,22 @@
 # -*- coding: utf-8 -*-
-"""
-"""
-# %%
+
 from __future__ import annotations
-import networkx as nx
+
 from dataclasses import dataclass, field
-from enum import Enum,IntEnum
-from typing import Dict, List, Tuple, Optional
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
+import networkx as nx
 
-class StateGraph:
-
-    # GTR = StateGraph()
-    LONG_PATH = ['IDL', 'ENL', 'TRL', 'EXL', 'IDL']
-    SHORT_PATH = ['IDS', 'ENS', 'TRS', 'EXS', 'IDS']
-
-    def __init__(self):
-        self.g = nx.DiGraph()
-        self.g.add_edges_from(zip(self.LONG_PATH[:-1], self.LONG_PATH[1:]))
-        self.g.add_edges_from(zip(self.SHORT_PATH[:-1], self.SHORT_PATH[1:]))
-
-class TradeState(IntEnum):
-    IDLE = 0
-    ENTER = 1
-    TRAILING = 2
-    EXIT = 3
-    
-class TradeAction(IntEnum):
-    HOLD = 0
-    BUY = 1
-    SELL = 2
 
 class State(str, Enum):
-    IDLE = "IDLE"
-    READY = "READY"
-    ENTER = "ENTER"
-    LONG = "LONG"
-    EXIT = "EXIT"
-    
+    IDLE = "IDLE"      # strategy inactive
+    READY = "READY"    # active, flat, scanning
+    ENTER = "ENTER"    # entry process active
+    LONG = "LONG"      # long position open
+    EXIT = "EXIT"      # exit process active
+
+
 class Event(str, Enum):
     ACTIVATE = "ACTIVATE"
     DEACTIVATE = "DEACTIVATE"
@@ -55,6 +34,7 @@ class Event(str, Enum):
 
     EXIT_FILLED = "EXIT_FILLED"
 
+
 @dataclass
 class Position:
     in_position: bool = False
@@ -69,7 +49,8 @@ class Position:
         self.entry_price = None
         self.highest_price = None
         self.trailing_stop = None
-        
+
+
 @dataclass
 class TransitionResult:
     previous_state: State
@@ -77,6 +58,7 @@ class TransitionResult:
     next_state: State
     changed: bool
     reason: str = ""
+
 
 @dataclass
 class TradingStateMachine:
@@ -107,73 +89,165 @@ class TradingStateMachine:
                 (State.EXIT, Event.EXIT_FILLED): State.READY,
                 (State.EXIT, Event.DEACTIVATE): State.IDLE,
             }
-        self._build_graph()
 
+        self.graph = self._build_graph()
 
-    def _build_graph(self) -> None:
-        self.graph.add_nodes_from([s.value for s in State])
-        for (src, event), dst in self.transitions.items():
-            self.graph.add_edge(src.value, dst.value, event=event.value)
+    def _build_graph(self) -> nx.DiGraph:
+        g = nx.DiGraph()
+        g.add_nodes_from([state.value for state in State])
+
+        for (source_state, event), target_state in self.transitions.items():
+            g.add_edge(
+                source_state.value,
+                target_state.value,
+                event=event.value,
+            )
+
+        return g
 
     def allowed_events(self) -> List[Event]:
-        return [event for (state, event), _ in self.transitions.items() if state == self.state]
+        return [
+            event
+            for (state, event), _ in self.transitions.items()
+            if state == self.state
+        ]
 
     def can_transition(self, event: Event) -> bool:
         return (self.state, event) in self.transitions
 
-    def step(self, event: Event, price: Optional[float] = None, trailing_pct: float = 0.02) -> State:
-        if not self.can_transition(event):
-            raise ValueError(f"Invalid transition: state={self.state.value}, event={event.value}")
+    def _update_trailing_stop(self, price: float) -> None:
+        if not self.position.in_position:
+            return
 
+        if self.position.highest_price is None:
+            self.position.highest_price = price
+
+        if price > self.position.highest_price:
+            self.position.highest_price = price
+
+        self.position.trailing_stop = self.position.highest_price * (
+            1.0 - self.trailing_pct
+        )
+
+    def trailing_exit_triggered(self, price: float) -> bool:
+        if not self.position.in_position:
+            return False
+
+        if self.position.trailing_stop is None:
+            return False
+
+        return price <= self.position.trailing_stop
+
+    def step(
+        self,
+        event: Event,
+        *,
+        price: Optional[float] = None,
+        qty: float = 1.0,
+        reason: str = "",
+    ) -> TransitionResult:
+        if not self.can_transition(event):
+            raise ValueError(
+                f"Invalid transition: state={self.state.value}, event={event.value}"
+            )
+
+        previous_state = self.state
         next_state = self.transitions[(self.state, event)]
 
-        # side effects
-        if self.state == State.ENL and event == Event.ENTRY_FILLED:
+        if previous_state == State.ENTER and event == Event.ENTRY_FILLED:
             if price is None:
                 raise ValueError("price is required for ENTRY_FILLED")
+
             self.position.in_position = True
+            self.position.qty = qty
             self.position.entry_price = price
             self.position.highest_price = price
-            self.position.trailing_stop = price * (1 - trailing_pct)
+            self.position.trailing_stop = price * (1.0 - self.trailing_pct)
 
-        elif self.state == State.TRL and event == Event.HOLD:
-            if self.position.in_position and price is not None:
-                if self.position.highest_price is None or price > self.position.highest_price:
-                    self.position.highest_price = price
-                    self.position.trailing_stop = self.position.highest_price * (1 - trailing_pct)
+        elif previous_state == State.LONG and event == Event.HOLD:
+            if price is None:
+                raise ValueError("price is required for HOLD while LONG")
 
-        elif self.state == State.EXL and event == Event.EXIT_FILLED:
-            self.position = Position()
+            self._update_trailing_stop(price)
+
+        elif previous_state == State.EXIT and event == Event.EXIT_FILLED:
+            self.position.reset()
+
+        elif previous_state == State.LONG and event == Event.HALT:
+            self.position.reset()
+
+        elif event == Event.DEACTIVATE:
+            self.position.reset()
 
         self.state = next_state
-        return self.state
-# %% Examples
 
-sm = TradingStateMachine()
+        return TransitionResult(
+            previous_state=previous_state,
+            event=event,
+            next_state=next_state,
+            changed=previous_state != next_state,
+            reason=reason,
+        )
 
-print(sm.state)  # IDL
-print([e.value for e in sm.allowed_events()])
-# %%
-sm.step(Event.BUY_SIGNAL)
-print(sm.state)  # ENL
-# %%
-sm.step(Event.ENTRY_FILLED, price=100.0)
-print(sm.state)  # TRL
-print(sm.position)
+    def on_price(self, price: float) -> Optional[TransitionResult]:
+        if self.state != State.LONG:
+            return None
 
-sm.step(Event.HOLD, price=103.0)
-print(sm.state)  # TRL
-print(sm.position.trailing_stop)
+        self._update_trailing_stop(price)
 
-sm.step(Event.EXIT_SIGNAL)
-print(sm.state)  # EXL
+        if self.trailing_exit_triggered(price):
+            return self.step(
+                Event.EXIT_SIGNAL,
+                price=price,
+                reason="Trailing stop triggered",
+            )
 
-sm.step(Event.EXIT_FILLED)
-print(sm.state)  # IDL
-print(sm.position)
+        return TransitionResult(
+            previous_state=State.LONG,
+            event=Event.HOLD,
+            next_state=State.LONG,
+            changed=False,
+            reason="Position managed",
+        )
 
-nx.draw_networkx(sm.graph)
-e = sm.graph.edges(data=True)
+    def snapshot(self) -> dict:
+        return {
+            "state": self.state.value,
+            "in_position": self.position.in_position,
+            "qty": self.position.qty,
+            "entry_price": self.position.entry_price,
+            "highest_price": self.position.highest_price,
+            "trailing_stop": self.position.trailing_stop,
+            "allowed_events": [event.value for event in self.allowed_events()],
+        }
+
+
+if __name__ == "__main__":
+    sm = TradingStateMachine(trailing_pct=0.02)
+
+    print(sm.snapshot())
+
+    print(sm.step(Event.ACTIVATE, reason="Strategy activated"))
+    print(sm.snapshot())
+
+    print(sm.step(Event.BUY_SIGNAL, reason="Long setup detected"))
+    print(sm.snapshot())
+
+    print(sm.step(Event.ENTRY_FILLED, price=100.0, qty=1.0, reason="Entry filled"))
+    print(sm.snapshot())
+
+    print(sm.on_price(103.0))
+    print(sm.snapshot())
+
+    print(sm.on_price(101.0))
+    print(sm.snapshot())
+
+    if sm.state == State.EXIT:
+        print(sm.step(Event.EXIT_FILLED, reason="Exit filled"))
+
+    print(sm.snapshot())
+
+    print(list(sm.graph.edges(data=True)))
 # %%
 import dash
 from dash import dcc, html, dash_table, Input, Output
